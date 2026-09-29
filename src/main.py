@@ -26,6 +26,24 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 BOOKS_FILE = OUTPUT_DIR / "books.json"
 ERRORS_FILE = OUTPUT_DIR / "errors.json"
+REPORT_FILE = OUTPUT_DIR / "run-report.json"
+
+# Stage 5 failure test
+INJECT_BROKEN_URL = True
+
+
+# --------------------------------------------------
+# RUN STATISTICS
+# --------------------------------------------------
+
+run_started = datetime.now(timezone.utc)
+run_start_timer = time.perf_counter()
+
+stats = {
+    "pages_fetched": 0,
+    "cache_hits": 0,
+    "failed_pages": 0,
+}
 
 
 # --------------------------------------------------
@@ -45,7 +63,7 @@ class BookRecord(BaseModel):
 
 
 # --------------------------------------------------
-# FETCH + CACHE
+# FETCH + CACHE + RETRY
 # --------------------------------------------------
 
 def fetch_page(page_url, cache_path):
@@ -56,38 +74,133 @@ def fetch_page(page_url, cache_path):
         exist_ok=True
     )
 
+    # Use cached HTML if available
     if cache_path.exists():
-        print(f"CACHE HIT: {cache_path.name}")
+        stats["cache_hits"] += 1
+
+        print(
+            f"CACHE HIT: {cache_path.name}"
+        )
 
         return cache_path.read_text(
             encoding="utf-8"
         )
 
-    print(f"FETCH: {page_url}")
+    max_attempts = 2
 
-    response = requests.get(
-        page_url,
-        headers=HEADERS,
-        timeout=5
-    )
+    for attempt in range(1, max_attempts + 1):
 
-    if response.status_code != 200:
-        raise Exception(
-            f"Request failed with status {response.status_code}"
-        )
+        try:
+            print(
+                f"FETCH attempt={attempt}: {page_url}"
+            )
 
-    response.encoding = "utf-8"
+            response = requests.get(
+                page_url,
+                headers=HEADERS,
+                timeout=5
+            )
 
-    html = response.text
+            stats["pages_fetched"] += 1
 
-    cache_path.write_text(
-        html,
-        encoding="utf-8"
-    )
 
-    time.sleep(0.5)
+            # --------------------------------------
+            # SUCCESS
+            # --------------------------------------
 
-    return html
+            if response.status_code == 200:
+
+                response.encoding = "utf-8"
+
+                html = response.text
+
+                cache_path.write_text(
+                    html,
+                    encoding="utf-8"
+                )
+
+                time.sleep(0.5)
+
+                return html
+
+
+            # --------------------------------------
+            # DO NOT RETRY 403 OR 404
+            # --------------------------------------
+
+            if response.status_code in (
+                403,
+                404
+            ):
+
+                raise Exception(
+                    f"HTTP {response.status_code}"
+                )
+
+
+            # --------------------------------------
+            # RETRY 5xx ONCE
+            # --------------------------------------
+
+            if 500 <= response.status_code <= 599:
+
+                if attempt < max_attempts:
+
+                    print(
+                        f"Server error "
+                        f"{response.status_code}. "
+                        f"Retrying once..."
+                    )
+
+                    time.sleep(1)
+
+                    continue
+
+                raise Exception(
+                    f"HTTP {response.status_code}"
+                )
+
+
+            # --------------------------------------
+            # OTHER HTTP ERRORS
+            # --------------------------------------
+
+            raise Exception(
+                f"HTTP {response.status_code}"
+            )
+
+
+        # ------------------------------------------
+        # RETRY TIMEOUT ONCE
+        # ------------------------------------------
+
+        except requests.Timeout:
+
+            if attempt < max_attempts:
+
+                print(
+                    "Request timed out. "
+                    "Retrying once..."
+                )
+
+                time.sleep(1)
+
+                continue
+
+            raise Exception(
+                "Request timed out after retry"
+            )
+
+
+        # ------------------------------------------
+        # OTHER NETWORK ERRORS
+        # ------------------------------------------
+
+        except requests.RequestException as error:
+
+            raise Exception(
+                f"Network error: {error}"
+            )
 
 
 # --------------------------------------------------
@@ -97,6 +210,7 @@ def fetch_page(page_url, cache_path):
 catalogue_pages = 0
 current_page_url = START_URL
 discovered_books = []
+
 
 while current_page_url and catalogue_pages < 3:
 
@@ -148,7 +262,7 @@ while current_page_url and catalogue_pages < 3:
 
 
 # --------------------------------------------------
-# REMOVE DUPLICATE BOOK URLS
+# REMOVE DUPLICATES
 # --------------------------------------------------
 
 unique_books = {}
@@ -158,7 +272,11 @@ for book in discovered_books:
     product_url = book["product_url"]
 
     if product_url not in unique_books:
-        unique_books[product_url] = book
+
+        unique_books[
+            product_url
+        ] = book
+
 
 books_to_scrape = list(
     unique_books.values()
@@ -179,138 +297,213 @@ print(
 
 
 # --------------------------------------------------
-# EXTRACT RAW RECORDS
+# ADD FAKE URL FOR STAGE 5 FAILURE TEST
+# --------------------------------------------------
+
+if INJECT_BROKEN_URL:
+
+    books_to_scrape.append({
+        "product_url":
+            "https://books.toscrape.com/catalogue/"
+            "this-book-does-not-exist-999999/"
+            "index.html",
+
+        "source_page":
+            START_URL
+    })
+
+
+# --------------------------------------------------
+# EXTRACT DETAIL PAGES
 # --------------------------------------------------
 
 raw_records = []
+failed_pages = []
+
 
 for book in books_to_scrape:
 
     product_url = book["product_url"]
     source_page = book["source_page"]
 
-    parsed_url = urlparse(product_url)
+    try:
 
-    product_slug = Path(
-        parsed_url.path
-    ).parent.name
-
-    detail_cache = (
-        f"cache/details/{product_slug}.html"
-    )
-
-    html = fetch_page(
-        product_url,
-        detail_cache
-    )
-
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
-    )
-
-
-    # TITLE
-
-    title_element = soup.select_one(
-        "div.product_main h1"
-    )
-
-    title = (
-        title_element.get_text(strip=True)
-        if title_element
-        else None
-    )
-
-
-    # PRICE
-
-    price_element = soup.select_one(
-        "div.product_main p.price_color"
-    )
-
-    price_text = (
-        price_element.get_text(strip=True)
-        if price_element
-        else None
-    )
-
-
-    # AVAILABILITY
-
-    availability_element = soup.select_one(
-        "div.product_main p.availability"
-    )
-
-    availability_text = (
-        availability_element.get_text(
-            " ",
-            strip=True
-        )
-        if availability_element
-        else None
-    )
-
-
-    # RATING
-
-    rating_element = soup.select_one(
-        "div.product_main p.star-rating"
-    )
-
-    rating_text = None
-
-    if rating_element:
-
-        rating_classes = rating_element.get(
-            "class",
-            []
+        parsed_url = urlparse(
+            product_url
         )
 
-        for rating_class in rating_classes:
+        product_slug = Path(
+            parsed_url.path
+        ).parent.name
 
-            if rating_class != "star-rating":
-                rating_text = rating_class
-                break
-
-
-    # DESCRIPTION
-
-    description_element = soup.select_one(
-        "#product_description + p"
-    )
-
-    description = (
-        description_element.get_text(
-            " ",
-            strip=True
+        detail_cache = (
+            f"cache/details/"
+            f"{product_slug}.html"
         )
-        if description_element
-        else None
-    )
+
+        html = fetch_page(
+            product_url,
+            detail_cache
+        )
+
+        soup = BeautifulSoup(
+            html,
+            "html.parser"
+        )
 
 
-    # FETCH TIME
+        # ------------------------------------------
+        # TITLE
+        # ------------------------------------------
 
-    fetched_at = datetime.now(
-        timezone.utc
-    ).isoformat()
+        title_element = soup.select_one(
+            "div.product_main h1"
+        )
+
+        title = (
+            title_element.get_text(
+                strip=True
+            )
+            if title_element
+            else None
+        )
 
 
-    raw_record = {
-        "title": title,
-        "product_url": product_url,
-        "price_text": price_text,
-        "availability_text": availability_text,
-        "rating_text": rating_text,
-        "description": description,
-        "source_page": source_page,
-        "fetched_at": fetched_at
-    }
+        # ------------------------------------------
+        # PRICE
+        # ------------------------------------------
 
-    raw_records.append(
-        raw_record
-    )
+        price_element = soup.select_one(
+            "div.product_main p.price_color"
+        )
+
+        price_text = (
+            price_element.get_text(
+                strip=True
+            )
+            if price_element
+            else None
+        )
+
+
+        # ------------------------------------------
+        # AVAILABILITY
+        # ------------------------------------------
+
+        availability_element = soup.select_one(
+            "div.product_main p.availability"
+        )
+
+        availability_text = (
+            availability_element.get_text(
+                " ",
+                strip=True
+            )
+            if availability_element
+            else None
+        )
+
+
+        # ------------------------------------------
+        # RATING
+        # ------------------------------------------
+
+        rating_element = soup.select_one(
+            "div.product_main p.star-rating"
+        )
+
+        rating_text = None
+
+        if rating_element:
+
+            rating_classes = rating_element.get(
+                "class",
+                []
+            )
+
+            for rating_class in rating_classes:
+
+                if rating_class != "star-rating":
+
+                    rating_text = rating_class
+
+                    break
+
+
+        # ------------------------------------------
+        # DESCRIPTION
+        # ------------------------------------------
+
+        description_element = soup.select_one(
+            "#product_description + p"
+        )
+
+        description = (
+            description_element.get_text(
+                " ",
+                strip=True
+            )
+            if description_element
+            else None
+        )
+
+
+        # ------------------------------------------
+        # FETCH TIME
+        # ------------------------------------------
+
+        fetched_at = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+
+        # ------------------------------------------
+        # RAW RECORD
+        # ------------------------------------------
+
+        raw_record = {
+            "title": title,
+            "product_url": product_url,
+            "price_text": price_text,
+            "availability_text":
+                availability_text,
+            "rating_text": rating_text,
+            "description": description,
+            "source_page": source_page,
+            "fetched_at": fetched_at
+        }
+
+        raw_records.append(
+            raw_record
+        )
+
+
+    # ----------------------------------------------
+    # ONE BAD PAGE DOES NOT KILL THE RUN
+    # ----------------------------------------------
+
+    except Exception as error:
+
+        stats["failed_pages"] += 1
+
+        failed_page = {
+            "url": product_url,
+            "reason": str(error)
+        }
+
+        failed_pages.append(
+            failed_page
+        )
+
+        print(
+            f"FAILED: {product_url}"
+        )
+
+        print(
+            f"Reason: {error}"
+        )
+
+        continue
 
 
 print(
@@ -323,32 +516,41 @@ print(
 # --------------------------------------------------
 
 valid_records = []
-errors = []
+validation_errors = []
+
 
 for raw_record in raw_records:
 
     try:
-        # Convert "£51.77" -> 51.77
-        price_text = raw_record["price_text"]
+
+        price_text = raw_record[
+            "price_text"
+        ]
 
         price_gbp = float(
-            price_text.replace("£", "").strip()
+            price_text
+            .replace("£", "")
+            .strip()
         )
+
 
         normalized_record = {
             **raw_record,
             "price_gbp": price_gbp
         }
 
+
         validated = BookRecord(
             **normalized_record
         )
+
 
         valid_records.append(
             validated.model_dump(
                 mode="json"
             )
         )
+
 
     except (
         ValidationError,
@@ -357,21 +559,24 @@ for raw_record in raw_records:
         AttributeError
     ) as error:
 
-        errors.append({
+        validation_errors.append({
             "record": raw_record,
             "reason": str(error)
         })
 
 
 # --------------------------------------------------
-# REMOVE DUPLICATES AGAIN BY CANONICAL PRODUCT URL
+# DEDUPLICATE BY CANONICAL PRODUCT URL
 # --------------------------------------------------
 
 deduplicated_records = {}
 
+
 for record in valid_records:
 
-    product_url = record["product_url"]
+    product_url = record[
+        "product_url"
+    ]
 
     deduplicated_records[
         product_url
@@ -384,7 +589,30 @@ final_records = list(
 
 
 # --------------------------------------------------
-# WRITE JSON OUTPUT
+# BUILD ERRORS.JSON
+# --------------------------------------------------
+
+all_errors = []
+
+
+for error in validation_errors:
+
+    all_errors.append({
+        "type": "validation_error",
+        **error
+    })
+
+
+for failed_page in failed_pages:
+
+    all_errors.append({
+        "type": "failed_page",
+        **failed_page
+    })
+
+
+# --------------------------------------------------
+# WRITE BOOKS.JSON
 # --------------------------------------------------
 
 BOOKS_FILE.write_text(
@@ -396,9 +624,14 @@ BOOKS_FILE.write_text(
     encoding="utf-8"
 )
 
+
+# --------------------------------------------------
+# WRITE ERRORS.JSON
+# --------------------------------------------------
+
 ERRORS_FILE.write_text(
     json.dumps(
-        errors,
+        all_errors,
         indent=2,
         ensure_ascii=False
     ),
@@ -407,15 +640,102 @@ ERRORS_FILE.write_text(
 
 
 # --------------------------------------------------
-# STAGE 4 CHECKPOINT
+# RUN REPORT
 # --------------------------------------------------
 
+run_finished = datetime.now(
+    timezone.utc
+)
+
+duration_seconds = (
+    time.perf_counter()
+    - run_start_timer
+)
+
+
+run_report = {
+    "started_at":
+        run_started.isoformat(),
+
+    "finished_at":
+        run_finished.isoformat(),
+
+    "duration_seconds":
+        round(
+            duration_seconds,
+            2
+        ),
+
+    "catalogue_pages":
+        catalogue_pages,
+
+    "discovered":
+        len(discovered_books),
+
+    "unique_urls":
+        len(unique_books),
+
+    "pages_fetched":
+        stats["pages_fetched"],
+
+    "cache_hits":
+        stats["cache_hits"],
+
+    "valid_records":
+        len(final_records),
+
+    "invalid_records":
+        len(validation_errors),
+
+    "failed_pages":
+        stats["failed_pages"]
+}
+
+
+REPORT_FILE.write_text(
+    json.dumps(
+        run_report,
+        indent=2,
+        ensure_ascii=False
+    ),
+    encoding="utf-8"
+)
+
+
+# --------------------------------------------------
+# STAGE 5 CHECKPOINT
+# --------------------------------------------------
+
+print("\nRUN COMPLETE")
+
 print(
-    f"valid_records={len(final_records)}"
+    f"valid_records="
+    f"{len(final_records)}"
 )
 
 print(
-    f"invalid_records={len(errors)}"
+    f"invalid_records="
+    f"{len(validation_errors)}"
+)
+
+print(
+    f"failed_pages="
+    f"{stats['failed_pages']}"
+)
+
+print(
+    f"cache_hits="
+    f"{stats['cache_hits']}"
+)
+
+print(
+    f"pages_fetched="
+    f"{stats['pages_fetched']}"
+)
+
+print(
+    f"duration_seconds="
+    f"{round(duration_seconds, 2)}"
 )
 
 print(
@@ -424,4 +744,8 @@ print(
 
 print(
     f"errors_file={ERRORS_FILE}"
+)
+
+print(
+    f"report_file={REPORT_FILE}"
 )
