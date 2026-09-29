@@ -1,3 +1,4 @@
+import json
 import time
 import requests
 
@@ -5,6 +6,9 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from datetime import datetime, timezone
+from typing import Optional
+
+from pydantic import BaseModel, HttpUrl, ValidationError
 
 
 # --------------------------------------------------
@@ -16,6 +20,28 @@ START_URL = "https://books.toscrape.com/catalogue/page-1.html"
 HEADERS = {
     "User-Agent": "FlyRankInternship-A9/1.0"
 }
+
+OUTPUT_DIR = Path("output")
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+BOOKS_FILE = OUTPUT_DIR / "books.json"
+ERRORS_FILE = OUTPUT_DIR / "errors.json"
+
+
+# --------------------------------------------------
+# PYDANTIC SCHEMA
+# --------------------------------------------------
+
+class BookRecord(BaseModel):
+    title: str
+    product_url: HttpUrl
+    price_text: str
+    price_gbp: float
+    availability_text: str
+    rating_text: str
+    description: Optional[str]
+    source_page: HttpUrl
+    fetched_at: str
 
 
 # --------------------------------------------------
@@ -69,11 +95,8 @@ def fetch_page(page_url, cache_path):
 # --------------------------------------------------
 
 catalogue_pages = 0
-
 current_page_url = START_URL
-
 discovered_books = []
-
 
 while current_page_url and catalogue_pages < 3:
 
@@ -137,7 +160,6 @@ for book in discovered_books:
     if product_url not in unique_books:
         unique_books[product_url] = book
 
-
 books_to_scrape = list(
     unique_books.values()
 )
@@ -157,11 +179,10 @@ print(
 
 
 # --------------------------------------------------
-# EXTRACT DETAIL PAGES
+# EXTRACT RAW RECORDS
 # --------------------------------------------------
 
 raw_records = []
-
 
 for book in books_to_scrape:
 
@@ -276,8 +297,6 @@ for book in books_to_scrape:
     ).isoformat()
 
 
-    # RAW RECORD
-
     raw_record = {
         "title": title,
         "product_url": product_url,
@@ -294,16 +313,115 @@ for book in books_to_scrape:
     )
 
 
+print(
+    f"detail_pages={len(raw_records)}"
+)
+
+
 # --------------------------------------------------
-# STAGE 3 CHECKPOINT
+# NORMALIZE + VALIDATE
 # --------------------------------------------------
 
-print("\nSAMPLE RAW RECORD:")
+valid_records = []
+errors = []
 
-if raw_records:
-    print(raw_records[0])
+for raw_record in raw_records:
 
+    try:
+        # Convert "£51.77" -> 51.77
+        price_text = raw_record["price_text"]
+
+        price_gbp = float(
+            price_text.replace("£", "").strip()
+        )
+
+        normalized_record = {
+            **raw_record,
+            "price_gbp": price_gbp
+        }
+
+        validated = BookRecord(
+            **normalized_record
+        )
+
+        valid_records.append(
+            validated.model_dump(
+                mode="json"
+            )
+        )
+
+    except (
+        ValidationError,
+        ValueError,
+        TypeError,
+        AttributeError
+    ) as error:
+
+        errors.append({
+            "record": raw_record,
+            "reason": str(error)
+        })
+
+
+# --------------------------------------------------
+# REMOVE DUPLICATES AGAIN BY CANONICAL PRODUCT URL
+# --------------------------------------------------
+
+deduplicated_records = {}
+
+for record in valid_records:
+
+    product_url = record["product_url"]
+
+    deduplicated_records[
+        product_url
+    ] = record
+
+
+final_records = list(
+    deduplicated_records.values()
+)
+
+
+# --------------------------------------------------
+# WRITE JSON OUTPUT
+# --------------------------------------------------
+
+BOOKS_FILE.write_text(
+    json.dumps(
+        final_records,
+        indent=2,
+        ensure_ascii=False
+    ),
+    encoding="utf-8"
+)
+
+ERRORS_FILE.write_text(
+    json.dumps(
+        errors,
+        indent=2,
+        ensure_ascii=False
+    ),
+    encoding="utf-8"
+)
+
+
+# --------------------------------------------------
+# STAGE 4 CHECKPOINT
+# --------------------------------------------------
 
 print(
-    f"\ndetail_pages={len(raw_records)}"
+    f"valid_records={len(final_records)}"
+)
+
+print(
+    f"invalid_records={len(errors)}"
+)
+
+print(
+    f"books_file={BOOKS_FILE}"
+)
+
+print(
+    f"errors_file={ERRORS_FILE}"
 )
