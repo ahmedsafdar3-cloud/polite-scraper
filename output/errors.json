@@ -1,7 +1,1 @@
-[
-  {
-    "type": "failed_page",
-    "url": "https://books.toscrape.com/catalogue/this-book-does-not-exist-999999/index.html",
-    "reason": "HTTP 404"
-  }
-]
+[]

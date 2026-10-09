@@ -1,3 +1,4 @@
+import argparse
 import json
 import time
 import requests
@@ -18,7 +19,7 @@ from pydantic import BaseModel, HttpUrl, ValidationError
 START_URL = "https://books.toscrape.com/catalogue/page-1.html"
 
 HEADERS = {
-    "User-Agent": "FlyRankInternship-A9/1.0"
+    "User-Agent": "PoliteScraper/1.0"
 }
 
 OUTPUT_DIR = Path("output")
@@ -28,8 +29,10 @@ BOOKS_FILE = OUTPUT_DIR / "books.json"
 ERRORS_FILE = OUTPUT_DIR / "errors.json"
 REPORT_FILE = OUTPUT_DIR / "run-report.json"
 
-# Stage 5 failure test
-INJECT_BROKEN_URL = True
+parser = argparse.ArgumentParser(description="Collect and validate the first three Books to Scrape catalogue pages.")
+parser.add_argument("--inject-failure", action="store_true", help="Include a deliberate missing URL to exercise error reporting")
+args = parser.parse_args()
+INJECT_BROKEN_URL = args.inject_failure
 
 
 # --------------------------------------------------
@@ -297,7 +300,7 @@ print(
 
 
 # --------------------------------------------------
-# ADD FAKE URL FOR STAGE 5 FAILURE TEST
+# OPTIONAL FAILURE INJECTION
 # --------------------------------------------------
 
 if INJECT_BROKEN_URL:
@@ -703,7 +706,7 @@ REPORT_FILE.write_text(
 
 
 # --------------------------------------------------
-# STAGE 5 CHECKPOINT
+# RUN SUMMARY
 # --------------------------------------------------
 
 print("\nRUN COMPLETE")
